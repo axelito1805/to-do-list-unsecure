@@ -95,3 +95,22 @@ class TaskViewsTest(TestCase):
 
         self.assertEqual(Task.objects.count(), 0)
         self.assertRedirects(response, "/")
+
+
+class SecurityFixesTest(TestCase):
+    """Tests des corrections de securite (ex. 14)"""
+
+    def test_search_echappe_le_html(self):
+        Task.objects.create(title="<script>alert(1)</script>")
+        response = self.client.get("/search/", {"q": "script"})
+        self.assertContains(response, "&lt;script&gt;")
+        self.assertNotContains(response, "<script>")
+
+    def test_admin_panel_refuse_sans_mot_de_passe(self):
+        response = self.client.post("/admin_panel/", {"pwd": ""})
+        self.assertEqual(response.status_code, 403)
+
+    def test_delete_refuse_open_redirect(self):
+        task = Task.objects.create(title="A supprimer")
+        response = self.client.post(f"/delete_task/{task.id}/?next=https://evil.example")
+        self.assertRedirects(response, "/", fetch_redirect_response=False)

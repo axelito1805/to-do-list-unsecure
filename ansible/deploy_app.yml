@@ -99,6 +99,63 @@
       args:
         creates: /usr/local/bin/uv
 
+    # EX14 : secrets et reglages par environnement, hors du depot
+    - name: Dossiers de configuration et de donnees
+      become: true
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: "{{ app_user }}"
+        mode: "0750"
+      loop:
+        - { path: /etc/todolist, owner: root }
+        - { path: "{{ base_dir }}/data", owner: "{{ app_user }}" }
+
+    - name: Fichier d'environnement de l'application (secrets)
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/todolist/todolist.env
+        owner: root
+        group: "{{ app_user }}"
+        mode: "0640"
+        content: |
+          DJANGO_SECRET_KEY={{ lookup('env', 'DJANGO_SECRET_KEY') }}
+          TODOLIST_ADMIN_PASSWORD={{ lookup('env', 'ADMIN_PASSWORD') }}
+          DJANGO_DEBUG={{ '1' if django_debug | default(false) | bool else '0' }}
+          DJANGO_ALLOWED_HOSTS={{ ansible_host }},localhost
+          DJANGO_SECURE_COOKIES=0
+          DJANGO_DB_PATH={{ base_dir }}/data/db.sqlite3
+      no_log: true
+      when: lookup('env', 'DJANGO_SECRET_KEY') | length > 0
+      notify: Redémarrer todolist
+
+    - name: Dossier de surcharge systemd du service
+      become: true
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ service_name }}.service.d"
+        state: directory
+        mode: "0755"
+
+    - name: Le service charge le fichier d'environnement
+      become: true
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ service_name }}.service.d/env.conf"
+        mode: "0644"
+        content: |
+          [Service]
+          EnvironmentFile=-/etc/todolist/todolist.env
+      notify: Redémarrer todolist
+
+    - name: Retirer l'ancien skip-worktree (sinon git refuse la mise a jour)
+      become: true
+      become_user: "{{ app_user }}"
+      ansible.builtin.shell: git ls-files -v | grep '^S' | cut -c3- | xargs -r -d '\n' git update-index --no-skip-worktree
+      args:
+        chdir: "{{ app_dir }}"
+        removes: "{{ app_dir }}/.git"
+      changed_when: false
+
     - name: Installer l'application en tant que {{ app_user }}
       become: true
       become_user: "{{ app_user }}"
@@ -113,21 +170,11 @@
             dest: "{{ app_dir }}"
             # EX3 : commit exact testé par Jenkins, sinon la branche
             version: "{{ app_commit | default(repo_branch) }}"
+            force: true
           notify: Redémarrer todolist
 
-        - name: Ignorer les modifications locales (base, .pyc, settings.py)
-          ansible.builtin.shell: git ls-files -z db.sqlite3 '*.pyc' todo/settings.py | xargs -0 git update-index --skip-worktree
-          args:
-            chdir: "{{ app_dir }}"
-          changed_when: false
-
-        - name: Passer Django en mode production (DEBUG = False)
-          ansible.builtin.lineinfile:
-            path: "{{ app_dir }}/todo/settings.py"
-            regexp: '^DEBUG\s*='
-            line: "DEBUG = False"
-          when: not (django_debug | default(true) | bool)
-          notify: Redémarrer todolist
+        # EX14 : plus de skip-worktree ni de sed sur settings.py,
+        # DEBUG et les secrets passent par /etc/todolist/todolist.env
 
         - name: Créer le venv en Python {{ python_version }}
           ansible.builtin.command: "/usr/local/bin/uv venv --seed --python {{ python_version }} {{ venv_dir }}"
@@ -160,9 +207,12 @@
           notify: Redémarrer todolist
 
         - name: Appliquer les migrations Django
-          ansible.builtin.command: "{{ venv_dir }}/bin/python manage.py migrate --noinput"
+          ansible.builtin.shell: |
+            if [ -f /etc/todolist/todolist.env ]; then set -a; . /etc/todolist/todolist.env; set +a; fi
+            {{ venv_dir }}/bin/python manage.py migrate --noinput
           args:
             chdir: "{{ app_dir }}"
+            executable: /bin/bash
           register: migrate
           changed_when: "'No migrations to apply' not in migrate.stdout"
 
