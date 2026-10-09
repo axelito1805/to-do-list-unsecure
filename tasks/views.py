@@ -6,6 +6,7 @@ from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.html import format_html, format_html_join
 from django.utils.http import url_has_allowed_host_and_scheme
+from django.views.decorators.http import require_GET, require_POST
 
 from .forms import TaskForm
 from .models import Task
@@ -53,6 +54,7 @@ def delete_task(request, pk):
     return render(request, "tasks/delete.html", {"item": item})
 
 
+@require_GET
 def search_tasks(request):
     query = request.GET.get("q", "")
     tasks = Task.objects.filter(title__icontains=query)
@@ -60,6 +62,7 @@ def search_tasks(request):
     return HttpResponse(format_html("<ul>{}</ul>", items))
 
 
+@require_POST
 def admin_panel(request):
     expected = os.environ.get("TODOLIST_ADMIN_PASSWORD", "")
     provided = request.POST.get("pwd", "")
