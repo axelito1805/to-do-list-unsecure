@@ -1,0 +1,473 @@
+# =====================================================================
+# Play 1 : mises à jour du système
+# =====================================================================
+- name: Mises à jour du système
+  hosts: my_infra
+  become: true
+  tags: [updates]
+
+  tasks:
+    - name: Mettre à jour la liste des paquets et appliquer les mises à jour
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        upgrade: true
+
+    - name: Installer unattended-upgrades
+      ansible.builtin.apt:
+        name:
+          - unattended-upgrades
+          - apt-listchanges
+        state: present
+
+    - name: Activer l'installation automatique des mises à jour de sécurité
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Vérifier si un redémarrage est nécessaire
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Redémarrer la VM si une mise à jour l'exige
+      ansible.builtin.reboot:
+      when: reboot_required.stat.exists
+
+# =====================================================================
+# Play 2 : déploiement de l'application
+# =====================================================================
+- name: Déploiement de l'application todolist
+  hosts: my_infra
+  tags: [app]
+  vars:
+    app_user: todolist
+    base_dir: /opt/todo
+    app_dir: /opt/todo/app
+    venv_dir: /opt/todo/venv
+    # EX3 : ton fork (Jenkins et les corrections passent par lui)
+    repo_url: https://github.com/axelito1805/to-do-list-unsecure.git
+    repo_branch: main
+    python_version: "3.14"
+    service_name: todolist
+
+  # EX3 : garde-fou, la prod ne reçoit que la branche main
+  pre_tasks:
+    - name: La prod ne reçoit que la branche main
+      ansible.builtin.assert:
+        that: not ('prod' in group_names and repo_branch != 'main')
+        fail_msg: "Déploiement refusé : {{ repo_branch }} n'est pas main"
+        success_msg: "Branche {{ repo_branch }} autorisée sur {{ inventory_hostname }}"
+
+  tasks:
+    - name: Installer les paquets système nécessaires
+      become: true
+      ansible.builtin.apt:
+        name:
+          - git
+          - curl
+          - acl
+          - python3-setuptools
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Créer l'utilisateur dédié {{ app_user }} (sans shell ni sudo)
+      become: true
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        home: "{{ base_dir }}"
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    - name: Créer le répertoire de base
+      become: true
+      ansible.builtin.file:
+        path: "{{ base_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0750"
+
+    - name: Installer uv pour tout le système
+      become: true
+      ansible.builtin.shell: curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+      args:
+        creates: /usr/local/bin/uv
+
+    - name: Installer l'application en tant que {{ app_user }}
+      become: true
+      become_user: "{{ app_user }}"
+      environment:
+        HOME: "{{ base_dir }}"
+        UV_PYTHON_INSTALL_DIR: "{{ base_dir }}/python"
+        UV_CACHE_DIR: "{{ base_dir }}/.cache/uv"
+      block:
+        - name: Récupérer les sources depuis GitHub
+          ansible.builtin.git:
+            repo: "{{ repo_url }}"
+            dest: "{{ app_dir }}"
+            # EX3 : commit exact testé par Jenkins, sinon la branche
+            version: "{{ app_commit | default(repo_branch) }}"
+          notify: Redémarrer todolist
+
+        - name: Ignorer les modifications locales (base, .pyc, settings.py)
+          ansible.builtin.shell: git ls-files -z db.sqlite3 '*.pyc' todo/settings.py | xargs -0 git update-index --skip-worktree
+          args:
+            chdir: "{{ app_dir }}"
+          changed_when: false
+
+        - name: Passer Django en mode production (DEBUG = False)
+          ansible.builtin.lineinfile:
+            path: "{{ app_dir }}/todo/settings.py"
+            regexp: '^DEBUG\s*='
+            line: "DEBUG = False"
+          when: not (django_debug | default(true) | bool)
+          notify: Redémarrer todolist
+
+        - name: Créer le venv en Python {{ python_version }}
+          ansible.builtin.command: "/usr/local/bin/uv venv --seed --python {{ python_version }} {{ venv_dir }}"
+          args:
+            creates: "{{ venv_dir }}/bin/python"
+
+        # EX3 : les dépendances viennent du Pipfile, plus de versions en dur
+        - name: Générer requirements.txt depuis le Pipfile
+          ansible.builtin.shell: |
+            {{ venv_dir }}/bin/python - <<'EOF'
+            import tomllib
+            pk = tomllib.load(open("{{ app_dir }}/Pipfile", "rb"))["packages"]
+            with open("{{ base_dir }}/requirements.txt", "w") as f:
+                for n, s in pk.items():
+                    s = s.get("version", "*") if isinstance(s, dict) else s
+                    f.write(n + ("" if s == "*" else s) + "\n")
+            EOF
+          changed_when: false
+
+        - name: Installer les dépendances Python du Pipfile
+          ansible.builtin.pip:
+            requirements: "{{ base_dir }}/requirements.txt"
+            virtualenv: "{{ venv_dir }}"
+          notify: Redémarrer todolist
+
+        - name: Installer gunicorn
+          ansible.builtin.pip:
+            name: gunicorn
+            virtualenv: "{{ venv_dir }}"
+          notify: Redémarrer todolist
+
+        - name: Appliquer les migrations Django
+          ansible.builtin.command: "{{ venv_dir }}/bin/python manage.py migrate --noinput"
+          args:
+            chdir: "{{ app_dir }}"
+          register: migrate
+          changed_when: "'No migrations to apply' not in migrate.stdout"
+
+    - name: Créer le service systemd {{ service_name }}
+      become: true
+      ansible.builtin.template:
+        src: templates/todolist.service.j2
+        dest: "/etc/systemd/system/{{ service_name }}.service"
+        mode: "0644"
+      notify: Redémarrer todolist
+
+    - name: Activer au démarrage et lancer le service {{ service_name }}
+      become: true
+      ansible.builtin.systemd_service:
+        name: "{{ service_name }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Appliquer les redémarrages en attente
+      ansible.builtin.meta: flush_handlers
+
+    - name: Vérifier que l'URL répond depuis le PC
+      ansible.builtin.uri:
+        url: "http://{{ ansible_host }}"
+        status_code: 200
+        return_content: true
+      delegate_to: localhost
+      register: check
+      until: check.status == 200
+      retries: 5
+      delay: 2
+
+    - name: Vérifier que la page affichée est bien la todolist
+      ansible.builtin.assert:
+        that: "'TO DO LIST' in check.content"
+        success_msg: "http://{{ ansible_host }} affiche bien la todolist"
+        fail_msg: "http://{{ ansible_host }} répond mais n'affiche pas la todolist"
+
+  handlers:
+    - name: Redémarrer todolist
+      become: true
+      ansible.builtin.systemd_service:
+        name: "{{ service_name }}"
+        state: restarted
+        daemon_reload: true
+
+# =====================================================================
+# Play 3 : durcissement
+# =====================================================================
+- name: Durcissement des VM
+  hosts: my_infra
+  become: true
+  tags: [hardening]
+  vars:
+    ssh_public_key_file: "{{ lookup('env', 'HOME') }}/.ssh/id-rda-infra.key.pub"
+    # EX3 : clé de déploiement de Jenkins
+    jenkins_public_key_file: "{{ lookup('env', 'HOME') }}/.ssh/jenkins_deploy.pub"
+    ssh_allowed_users: admin
+
+  tasks:
+    # ---------- SSH ----------
+    # EX3 : deux clés, celle de Jenkins n'est acceptée que depuis 192.168.56.20
+    - name: N'autoriser que nos clés pour admin (PC + Jenkins depuis .20)
+      ansible.posix.authorized_key:
+        user: admin
+        exclusive: true
+        key: |
+          {{ lookup('file', ssh_public_key_file) }}
+          from="192.168.56.20" {{ lookup('file', jenkins_public_key_file) }}
+
+    - name: Durcir la configuration SSH
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-hardening.conf
+        mode: "0644"
+        validate: /usr/sbin/sshd -t -f %s
+        content: |
+          PermitRootLogin no
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          AuthenticationMethods publickey
+          AllowUsers {{ ssh_allowed_users }}
+      notify: Redémarrer SSH
+
+    - name: Durcissement SSH supplémentaire (Lynis SSH-7408)
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/01-lynis.conf
+        mode: "0644"
+        validate: /usr/sbin/sshd -t -f %s
+        content: |
+          AllowTcpForwarding no
+          AllowAgentForwarding no
+          X11Forwarding no
+          MaxAuthTries 3
+          MaxSessions 2
+          ClientAliveCountMax 2
+          TCPKeepAlive no
+          LogLevel VERBOSE
+          Banner /etc/issue.net
+      notify: Redémarrer SSH
+      tags: [lynis_fixes]
+
+    - name: Redémarrer SSH maintenant si la configuration a changé
+      ansible.builtin.meta: flush_handlers
+
+    - name: Fermer la connexion SSH actuelle
+      ansible.builtin.meta: reset_connection
+
+    - name: Tester une nouvelle connexion SSH avec la nouvelle configuration
+      ansible.builtin.wait_for_connection:
+        timeout: 30
+
+    # ---------- pare-feu UFW ----------
+    - name: Installer UFW
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+
+    - name: Autoriser SSH et HTTP
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "22"
+        - "80"
+
+    - name: Politique par défaut des connexions entrantes (deny)
+      community.general.ufw:
+        default: deny
+        direction: incoming
+
+    - name: Politique par défaut des connexions sortantes (allow)
+      community.general.ufw:
+        default: allow
+        direction: outgoing
+
+    - name: Activer UFW
+      community.general.ufw:
+        state: enabled
+
+    # ---------- corrections Lynis ----------
+    - name: Durcir les paramètres du noyau (Lynis KRNL-6000)
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-hardening.conf
+        mode: "0644"
+        content: |
+          dev.tty.ldisc_autoload = 0
+          fs.protected_fifos = 2
+          fs.suid_dumpable = 0
+          kernel.core_uses_pid = 1
+          kernel.kptr_restrict = 2
+          kernel.sysrq = 0
+          net.core.bpf_jit_harden = 2
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.all.log_martians = 1
+          net.ipv4.conf.default.log_martians = 1
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+      notify: Appliquer sysctl
+      tags: [lynis_fixes]
+
+    - name: Ajouter une bannière légale (Lynis BANN-7126 et BANN-7130)
+      ansible.builtin.copy:
+        dest: "{{ item }}"
+        mode: "0644"
+        content: |
+          Authorized access only. All activity on this system is monitored and logged.
+          Unauthorized access is prohibited and will be prosecuted.
+      loop:
+        - /etc/issue
+        - /etc/issue.net
+      tags: [lynis_fixes]
+
+  handlers:
+    - name: Redémarrer SSH
+      ansible.builtin.systemd_service:
+        name: ssh
+        state: restarted
+
+    - name: Appliquer sysctl
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+# =====================================================================
+# Play 4 : audit Lynis uniquement avec --tags audit
+# =====================================================================
+- name: Audit de sécurité Lynis
+  hosts: my_infra
+  become: true
+  tags: [audit, never]
+
+  tasks:
+    - name: Installer Lynis
+      ansible.builtin.apt:
+        name: lynis
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Lancer l'audit
+      ansible.builtin.command: lynis audit system --quick --no-colors
+      changed_when: false
+
+    - name: Lire le score de durcissement
+      ansible.builtin.shell: grep '^hardening_index=' /var/log/lynis-report.dat | cut -d= -f2
+      register: hardening_index
+      changed_when: false
+
+    - name: Afficher le score
+      ansible.builtin.debug:
+        msg: "Hardening index de {{ inventory_hostname }} : {{ hardening_index.stdout }}"
+
+# =====================================================================
+# Play 5 : contrôles de sécurité automatiques
+# =====================================================================
+- name: Contrôles de sécurité
+  hosts: my_infra
+  tags: [verify]
+  vars:
+    ssh_key: "{{ lookup('env', 'HOME') }}/.ssh/id-rda-infra.key"
+    ssh_test_opts: "-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new"
+
+  tasks:
+    # ---------- SSH ----------
+    - name: Tenter une connexion SSH en root
+      ansible.builtin.command: "ssh {{ ssh_test_opts }} -i {{ ssh_key }} root@{{ ansible_host }} true"
+      delegate_to: localhost
+      register: ssh_root
+      failed_when: ssh_root.rc == 0
+      changed_when: false
+
+    - name: Tenter une connexion SSH par mot de passe
+      ansible.builtin.command: "ssh {{ ssh_test_opts }} -o PubkeyAuthentication=no admin@{{ ansible_host }} true"
+      delegate_to: localhost
+      register: ssh_password
+      failed_when: ssh_password.rc == 0
+      changed_when: false
+
+    - name: Vérifier que SSH n'accepte que les clés
+      ansible.builtin.assert:
+        that:
+          - "'Permission denied (publickey)' in ssh_root.stderr"
+          - "'Permission denied (publickey)' in ssh_password.stderr"
+        success_msg: "SSH : root refusé, mot de passe refusé, seule la clé est acceptée"
+        fail_msg: "SSH accepte encore autre chose qu'une clé"
+
+    - name: Compter les clés autorisées pour admin
+      become: true
+      ansible.builtin.command: grep -c . /home/admin/.ssh/authorized_keys
+      register: nb_keys
+      changed_when: false
+
+    # EX3 : deux clés attendues (PC + Jenkins)
+    - name: Vérifier que seules nos deux clés sont autorisées
+      ansible.builtin.assert:
+        that: nb_keys.stdout == "2"
+        success_msg: "Deux clés autorisées pour admin (PC + Jenkins)"
+        fail_msg: "{{ nb_keys.stdout }} clés autorisées pour admin au lieu de deux"
+
+    # ---------- UFW ----------
+    - name: Lire l'état d'UFW
+      become: true
+      ansible.builtin.command: ufw status verbose
+      register: ufw_status
+      changed_when: false
+
+    - name: Vérifier les règles UFW
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in ufw_status.stdout"
+          - "'deny (incoming)' in ufw_status.stdout"
+          - "'allow (outgoing)' in ufw_status.stdout"
+          - "ufw_status.stdout_lines | select('search', 'ALLOW IN') | list | length == 4"
+          - "ufw_status.stdout_lines | select('search', '^22/tcp') | list | length == 2"
+          - "ufw_status.stdout_lines | select('search', '^80/tcp') | list | length == 2"
+        success_msg: "UFW actif : deny incoming, allow outgoing, seuls 22 et 80 ouverts"
+        fail_msg: "La configuration UFW ne correspond pas à l'attendu"
+
+    - name: Lancer un serveur de test temporaire sur le port 8000 (15 s)
+      ansible.builtin.command: timeout 15 python3 -m http.server 8000
+      async: 20
+      poll: 0
+      changed_when: false
+
+    - name: Vérifier que le serveur de test écoute bien dans la VM
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 8000
+        timeout: 10
+
+    - name: Tenter d'atteindre le port 8000 depuis le PC
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 8000
+        timeout: 5
+      delegate_to: localhost
+      register: probe
+      failed_when: false
+
+    - name: Vérifier que le port 8000 est bloqué par UFW
+      ansible.builtin.assert:
+        that: "'Timeout' in (probe.msg | default(''))"
+        success_msg: "Port 8000 injoignable depuis le PC alors qu'un service y écoute : UFW bloque bien"
+        fail_msg: "Le port 8000 est joignable depuis le PC : le pare-feu ne bloque pas"
